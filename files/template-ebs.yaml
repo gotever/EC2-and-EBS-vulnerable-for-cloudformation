@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Sadcloud: EBS Snapshot is Public'
+
+Resources:
+  # 1. Xay dung o cung
+  MyVolume:
+    Type: 'AWS::EC2::Volume'
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: 1
+      VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Sadcloud_EBS_Volume
+
+  # 2. The ra vao cap them quyen tu chup anh va xem anh
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EBSSnapshotPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateSnapshot
+                  - ec2:DescribeSnapshots
+                  - ec2:ModifySnapshotAttribute
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # 3. Lambda lam tu A den Z
+  MakeSnapshotPublicLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300 # Cho phep lam viec toi da 5 phut vi doi chup anh hoi lau
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  ec2 = boto3.client('ec2')
+                  
+                  if event['RequestType'] == 'Create':
+                      vol_id = event['ResourceProperties']['VolumeId']
+
+                      # Buoc A: Tu tay chup anh
+                      snap = ec2.create_snapshot(VolumeId=vol_id, Description='Public Snapshot do Lambda chup')
+                      snap_id = snap['SnapshotId']
+
+                      # Buoc B: Doi anh chup xong
+                      waiter = ec2.get_waiter('snapshot_completed')
+                      waiter.wait(SnapshotIds=[snap_id])
+
+                      # Buoc C: Mo public
+                      ec2.modify_snapshot_attribute(
+                          Attribute='createVolumePermission',
+                          OperationType='add',
+                          SnapshotId=snap_id,
+                          GroupNames=['all']
+                      )
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'SnapshotId': snap_id})
+
+                  else:
+                      # Bao thanh cong khi xoa Stack
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+              except Exception as e:
+                  print("Loi to dung: ", e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Message': str(e)})
+
+  # 4. Goi Lambda day vao lam viec ngay sau khi MyVolume xay xong
+  TriggerLambda:
+    Type: 'Custom::EBSManager'
+    Properties:
+      ServiceToken: !GetAtt MakeSnapshotPublicLambda.Arn
+      VolumeId: !Ref MyVolume
